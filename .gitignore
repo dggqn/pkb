@@ -1,0 +1,4 @@
+backend/docker/.env
+backend/.idea/
+backend/**/__pycache__/
+backend/**/*.py[cod]
