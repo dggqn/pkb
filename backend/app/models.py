@@ -57,6 +57,12 @@ class NoteChunk(Base):
         default="pending",
         server_default="pending",
     )
+    es_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,

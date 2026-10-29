@@ -9,6 +9,7 @@ const messages = ref<Message[]>([])
 const question = ref('')
 const loading = ref(false)
 const error = ref('')
+const retryQuestion = ref('')
 const thread = ref<HTMLElement | null>(null)
 const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8001'
 
@@ -17,6 +18,7 @@ async function ask(value = question.value) {
   if (!text || loading.value) return
   question.value = ''
   error.value = ''
+  retryQuestion.value = ''
   messages.value.push({ id: Date.now(), role: 'user', content: text })
   loading.value = true
   await scrollToBottom()
@@ -31,11 +33,24 @@ async function ask(value = question.value) {
     messages.value.push({ id: Date.now() + 1, role: 'assistant', content: payload.answer, sources: payload.sources })
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : '无法连接后端，请确认 API 服务已启动。'
-    messages.value.pop()
+    // 保留失败的问题，用户能看见刚才发了什么，也可以明确重试。
+    retryQuestion.value = text
   } finally {
     loading.value = false
     await scrollToBottom()
   }
+}
+
+function retryLastRequest() {
+  const text = retryQuestion.value
+  if (!text) return
+
+  // 重试前移除失败时留下的问题气泡；ask 会重新添加一次，避免界面出现重复问题。
+  const lastMessage = messages.value.at(-1)
+  if (lastMessage?.role === 'user' && lastMessage.content === text) {
+    messages.value.pop()
+  }
+  void ask(text)
 }
 
 async function scrollToBottom() {
@@ -67,7 +82,7 @@ async function scrollToBottom() {
         </div>
       </article>
       <div v-if="loading" class="message message-assistant loading-message"><div class="assistant-mark">知</div><div><div class="message-label">知间</div><p>正在翻阅相关记录<span class="typing-dots">···</span></p></div></div>
-      <div v-if="error" class="request-error" role="alert">{{ error }}<button @click="ask(messages.at(-1)?.content)">重试</button></div>
+      <div v-if="error" class="request-error" role="alert">{{ error }}<button @click="retryLastRequest">重试</button></div>
     </section>
     <form class="composer" @submit.prevent="ask()">
       <textarea v-model="question" :disabled="loading" rows="1" placeholder="给知间发送消息" aria-label="给知间发送消息" @keydown.enter.exact.prevent="ask()" />

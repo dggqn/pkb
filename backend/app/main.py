@@ -1,14 +1,25 @@
 from contextlib import asynccontextmanager
-import re
 from hashlib import sha256
+from threading import Lock, Thread
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
-from fastapi import Depends, FastAPI, HTTPException, status
+logger = logging.getLogger(__name__)
+# 启动恢复和新笔记索引共用这把锁，避免同时处理同一批 pending chunks。
+_indexing_lock = Lock()
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+
 from sqlalchemy.orm import Session
 
-from app.database import Base, engine, get_db
+from app.database import Base, SessionLocal, engine, get_db
+
 from app.models import Note, NoteChunk
+
 from app.schemas import (
     NoteCreate,
     NoteCreated,
@@ -17,11 +28,27 @@ from app.schemas import (
     QueryResponse,
     QuerySource,
 )
+from app.services.hybrid_search import retrieve_hybrid_chunks
+from app.services.llm import generate_answer
 from app.services.chunking import split_into_chunks
+from app.services.chunk_indexing import (
+    index_pending_chunks,
+    index_pending_chunks_to_elasticsearch,
+)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 先确保数据库表已就绪，再启动积压索引恢复。
     Base.metadata.create_all(bind=engine)
+
+    # 在线程中恢复，避免模型加载或索引请求拖住 API 启动。
+    recovery_thread = Thread(
+        target=index_pending_chunks_in_background,
+        name="pending-index-recovery",
+        daemon=True,
+    )
+    recovery_thread.start()
+
     yield
 
 app = FastAPI(title="Personal Knowledge Base API", lifespan=lifespan)
@@ -37,8 +64,30 @@ app.add_middleware(
 def health_check() -> dict[str, str]:
     """Return a simple status check for the API."""
     return {"status": "ok"}
+def index_pending_chunks_in_background() -> None:
+    """用独立数据库会话分别处理两路 pending 索引。"""
+    # 启动恢复任务可能正好遇到新笔记请求，使用锁让索引任务依次执行。
+    with _indexing_lock:
+        db = SessionLocal()
+        try:
+            # 分开捕获两路错误：Qdrant 整体不可用时，仍继续尝试 ES。
+            try:
+                qdrant_result = index_pending_chunks(db)
+                logger.info("Qdrant 后台索引结果：%s", qdrant_result)
+            except Exception:
+                db.rollback()
+                logger.exception("Qdrant 后台索引任务失败")
+
+            try:
+                es_result = index_pending_chunks_to_elasticsearch(db)
+                logger.info("Elasticsearch 后台索引结果：%s", es_result)
+            except Exception:
+                db.rollback()
+                logger.exception("Elasticsearch 后台索引任务失败")
+        finally:
+            db.close()
 @app.post("/notes", response_model=NoteCreated)
-def create_note(note: NoteCreate, db: Session = Depends(get_db)) -> NoteCreated:
+def create_note(note: NoteCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> NoteCreated:
     """Save the original note and its text chunks in one transaction."""
     content = note.content.strip()
     if not content:
@@ -70,6 +119,8 @@ def create_note(note: NoteCreate, db: Session = Depends(get_db)) -> NoteCreated:
 
         # 原笔记和所有片段一起提交。
         db.commit()
+        # 先持久化笔记和 chunks，再安排后台索引，避免索引读取到未提交数据。
+        background_tasks.add_task(index_pending_chunks_in_background)
         db.refresh(record)
 
         return NoteCreated(id=record.id, status="saved")
@@ -86,42 +137,70 @@ def get_note(note_id: str, db: Session = Depends(get_db)) -> NoteRead:
 
 
 @app.post("/query", response_model=QueryResponse)
-def query_knowledge(request: QueryRequest, db: Session = Depends(get_db)) -> QueryResponse:
-    """Find notes with overlapping terms and return them as answer context."""
-    terms = _query_terms(request.question)
-    if not terms:
-        return QueryResponse(answer="问题中没有可用于检索的关键词。", sources=[])
+def query_knowledge(
+    request: QueryRequest,
+    db: Session = Depends(get_db),
+) -> QueryResponse:
+    """通过全文与向量混合检索笔记，并返回命中的片段作为来源。"""
+    try:
+        # 先多取一些候选，再在服务内融合 ES 与 Qdrant 的排名。
+        chunks = retrieve_hybrid_chunks(
+            db,
+            request.question,
+            candidate_limit=10,
+            result_limit=5,
+        )
+    except Exception as exc:
+        # 检索服务暂时不可用时返回明确的服务错误；
+        # 原始异常仍会保留在服务端日志中，便于排查。
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="检索服务暂时不可用，请稍后重试。",
+        ) from exc
 
-    notes = db.scalars(select(Note).order_by(Note.created_at.desc())).all()
-    ranked: list[tuple[int, Note]] = []
-    for note in notes:
-        content = note.content.casefold()
-        score = sum(content.count(term.casefold()) for term in terms)
-        if score:
-            ranked.append((score, note))
-    ranked.sort(key=lambda item: (item[0], item[1].created_at), reverse=True)
-    sources = [QuerySource(note_id=note.id, content=note.content) for _, note in ranked[:5]]
+    # 按 note_id 合并命中的片段，保证每篇笔记在来源列表中只出现一次。
+    # 字典保留首次插入顺序，因此来源仍按混合检索排名排列。
+    chunks_by_note: dict[str, list[str]] = {}
+    for chunk in chunks:
+        chunks_by_note.setdefault(chunk.note_id, []).append(chunk.content)
+
+    sources = [
+        QuerySource(
+            note_id=note_id,
+            content="\n…\n".join(contents),
+        )
+        for note_id, contents in chunks_by_note.items()
+    ]
 
     if not sources:
-        answer = "我暂时没有在你的笔记中找到与这个问题相关的内容。"
-    else:
-        excerpts = "\n".join(f"- {source.content}" for source in sources)
-        answer = f"找到以下可能相关的笔记：\n{excerpts}"
+        return QueryResponse(
+            answer="我暂时没有在你的笔记中找到相关内容。",
+            sources=[],
+        )
+
+    try:
+        # 将融合检索得到的来源片段交给大模型组织答案。
+        # 上下文顺序与前端来源列表一致，方便对应模型给出的资料编号。
+        answer, cited_source_indexes = generate_answer(
+            request.question,
+            [source.content for source in sources],
+        )
+    except Exception as exc:
+        # 模型服务异常时返回服务不可用，详细原因留在后端日志中。
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="答案生成服务暂时不可用，请稍后重试。",
+        ) from exc
+
+    # 只把答案明确引用的资料返回给前端，避免把召回到但没有用于回答的
+    # 候选笔记展示成“参考来源”。generate_answer 已将答案中的资料序号
+    # 重排为连续编号，因此这里按引用顺序选择对应来源即可。
+    sources = [
+        sources[index - 1]
+        for index in cited_source_indexes
+    ]
+
     return QueryResponse(answer=answer, sources=sources)
-
-
-def _query_terms(question: str) -> list[str]:
-    """Extract basic Latin words and Chinese character bigrams for MVP search."""
-    terms: list[str] = []
-    for chunk in re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", question.casefold()):
-        if re.fullmatch(r"[\u4e00-\u9fff]+", chunk):
-            terms.extend(chunk[index : index + 2] for index in range(len(chunk) - 1))
-            if len(chunk) == 1:
-                terms.append(chunk)
-        else:
-            terms.append(chunk)
-    return list(dict.fromkeys(terms))
-
 
 # if __name__ == "__main__":
 #     main()
