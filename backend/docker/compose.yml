@@ -18,6 +18,31 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+  elasticsearch:
+    build:
+      context: ./elasticsearch
+      dockerfile: Dockerfile
+    image: pkb-elasticsearch:8.19.10-ik
+    container_name: pkb-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "127.0.0.1:${ELASTICSEARCH_PORT:-9200}:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
 
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    container_name: pkb-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
 volumes:
   mysql_data:
+  elasticsearch_data:
+  qdrant_data:
