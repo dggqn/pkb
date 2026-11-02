@@ -33,7 +33,7 @@ uv sync
 uv run uvicorn app.main:app --reload --port 8001
 ```
 
-服务启动时会在后台扫描 MySQL 中两路索引状态为 `pending` 的 chunks，并分别尝试恢复到 Qdrant 和 Elasticsearch。查看启动日志中的 `Qdrant 后台索引结果` 与 `Elasticsearch 后台索引结果`。
+服务启动时会在后台扫描 MySQL 中两路索引状态为 `pending` 的 chunks，并分别尝试恢复到 Qdrant 和 Elasticsearch。服务运行期间，后台线程每 60 秒再扫描一次并重试仍为 `pending` 的项目。查看日志中的 `Qdrant 后台索引结果` 与 `Elasticsearch 后台索引结果`。
 
 健康检查：
 
@@ -45,7 +45,7 @@ Invoke-RestMethod http://127.0.0.1:8001/health
 
 通过 `POST /notes` 保存成功后，FastAPI 后台任务会分别索引 Qdrant 和 Elasticsearch。MySQL 中的 `index_status` 与 `es_status` 分别记录两路结果；只有对应写入成功后才会标记为 `indexed`。
 
-如果服务暂时不可用，失败项留在 `pending`，日志会记录错误。服务恢复后可以重启后端触发启动恢复；也可以在 `backend` 目录手动运行：
+如果索引服务暂时不可用，失败项留在 `pending`，日志会记录错误；后端运行时会每分钟自动重试。后端重启时也会立即恢复积压项。仍可在 `backend` 目录手动运行：
 
 ```powershell
 uv run python -m app.services.retry_pending_indexes

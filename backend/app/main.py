@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from hashlib import sha256
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
+from time import monotonic
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -10,6 +11,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # 启动恢复和新笔记索引共用这把锁，避免同时处理同一批 pending chunks。
 _indexing_lock = Lock()
+_INDEX_RETRY_INTERVAL_SECONDS = 60
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +31,11 @@ from app.schemas import (
     QuerySource,
 )
 from app.services.hybrid_search import retrieve_hybrid_chunks
-from app.services.llm import generate_answer
+from app.services.llm import (
+    generate_answer,
+    split_question_parts,
+    verify_answer_citations,
+)
 from app.services.chunking import split_into_chunks
 from app.services.chunk_indexing import (
     index_pending_chunks,
@@ -41,15 +47,23 @@ async def lifespan(_: FastAPI):
     # 先确保数据库表已就绪，再启动积压索引恢复。
     Base.metadata.create_all(bind=engine)
 
-    # 在线程中恢复，避免模型加载或索引请求拖住 API 启动。
-    recovery_thread = Thread(
-        target=index_pending_chunks_in_background,
-        name="pending-index-recovery",
+    # 持续扫描 MySQL 中的 pending 状态。MySQL 是持久待办来源，
+    # 后台索引失败或进程重启后都能再次尝试，不依赖内存任务队列。
+    stop_retry_worker = Event()
+    retry_worker = Thread(
+        target=retry_pending_indexes_periodically,
+        args=(stop_retry_worker,),
+        name="pending-index-retry",
         daemon=True,
     )
-    recovery_thread.start()
+    retry_worker.start()
 
-    yield
+    try:
+        yield
+    finally:
+        # 应用正常关闭时停止周期线程，避免它继续启动新的索引批次。
+        stop_retry_worker.set()
+        retry_worker.join(timeout=5)
 
 app = FastAPI(title="Personal Knowledge Base API", lifespan=lifespan)
 app.add_middleware(
@@ -86,6 +100,22 @@ def index_pending_chunks_in_background() -> None:
                 logger.exception("Elasticsearch 后台索引任务失败")
         finally:
             db.close()
+
+
+def retry_pending_indexes_periodically(stop_event: Event) -> None:
+    """启动时恢复 pending，并在服务运行期间按固定间隔自动重试。"""
+    while not stop_event.is_set():
+        started_at = monotonic()
+        index_pending_chunks_in_background()
+
+        # 使用 Event.wait 而非 sleep，让应用关闭时可以提前唤醒线程。
+        # 如果本轮处理耗时已超过间隔，则立即开始下一轮，尽快处理积压批次。
+        remaining = max(
+            0.0,
+            _INDEX_RETRY_INTERVAL_SECONDS - (monotonic() - started_at),
+        )
+        if stop_event.wait(remaining):
+            break
 @app.post("/notes", response_model=NoteCreated)
 def create_note(note: NoteCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> NoteCreated:
     """Save the original note and its text chunks in one transaction."""
@@ -144,12 +174,35 @@ def query_knowledge(
     """通过全文与向量混合检索笔记，并返回命中的片段作为来源。"""
     try:
         # 先多取一些候选，再在服务内融合 ES 与 Qdrant 的排名。
-        chunks = retrieve_hybrid_chunks(
-            db,
-            request.question,
-            candidate_limit=10,
-            result_limit=5,
-        )
+        # 主问题保持原有混合检索；问号/换行明确分开子问，分号只在两侧都像问句时拆分，
+        # 再逐句检索并去重合并，避免某一部分的词项把另一部分的资料挤出 Top 5。
+        # 这里只增加本地 embedding 与索引查询，不增加 LLM 调用次数。
+        question_parts = split_question_parts(request.question)
+        if len(question_parts) > 4:
+            question_parts = question_parts[:3] + ["；".join(question_parts[3:])]
+        search_queries = [request.question]
+        if len(question_parts) > 1:
+            search_queries.extend(question_parts)
+
+        chunks_by_id = {}
+        fused_scores: dict[str, float] = {}
+        for search_query in search_queries:
+            retrieved = retrieve_hybrid_chunks(
+                db,
+                search_query,
+                candidate_limit=10,
+                result_limit=5,
+            )
+            for rank, chunk in enumerate(retrieved, start=1):
+                chunks_by_id.setdefault(chunk.id, chunk)
+                # 多个子问句共同命中的片段优先，兼顾各子问题的资料覆盖。
+                fused_scores[chunk.id] = fused_scores.get(chunk.id, 0.0) + 1 / (60 + rank)
+        ranked_ids = sorted(
+            fused_scores,
+            key=lambda chunk_id: fused_scores[chunk_id],
+            reverse=True,
+        )[:5]
+        chunks = [chunks_by_id[chunk_id] for chunk_id in ranked_ids]
     except Exception as exc:
         # 检索服务暂时不可用时返回明确的服务错误；
         # 原始异常仍会保留在服务端日志中，便于排查。
@@ -187,6 +240,7 @@ def query_knowledge(
         )
     except Exception as exc:
         # 模型服务异常时返回服务不可用，详细原因留在后端日志中。
+        logger.exception("RAG answer generation or citation processing failed")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="答案生成服务暂时不可用，请稍后重试。",
@@ -198,6 +252,26 @@ def query_knowledge(
     sources = [
         sources[index - 1]
         for index in cited_source_indexes
+    ]
+
+    try:
+        # 生成阶段按模型引用筛出来源；再对每个事实句做一次支持性核验，
+        # 去掉无依据句子并重新整理引用与来源映射。
+        answer, verified_source_indexes = verify_answer_citations(
+            answer,
+            [source.content for source in sources],
+            question=request.question,
+        )
+    except Exception as exc:
+        logger.exception("RAG citation verification failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="答案引用核验服务暂时不可用，请稍后重试。",
+        ) from exc
+
+    sources = [
+        sources[index - 1]
+        for index in verified_source_indexes
     ]
 
     return QueryResponse(answer=answer, sources=sources)
